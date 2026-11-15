@@ -7,10 +7,14 @@
 //     counted and the request is retried on the next-best candidate, down the whole ranked list. A
 //     provider that refuses with 402, or twice in a row, is treated as spent for the rest of the
 //     trial and skipped, so its remaining requests are not wasted on it.
-//   - the tie-break (fewest provider calls): the trial's seed re-draws each provider's budget,
-//     failure schedule and outage (lib/plan.ts repeats the kit generator's own draw), and the
-//     router attempts first the best candidate whose next call the schedule lets through — one
-//     call a request when the schedule holds, with the full failover order kept behind it.
+//   - the tie-break (fewest provider calls): the workload is planned before the first request
+//     (lib/plan.ts): one route a request under a capacity per provider, the assignment that
+//     maximises the weighted rating. Where a run hands over the instance seed, the capacities are
+//     the drawn schedules' own (the generator's draw, repeated exactly); at make.fun's runs the
+//     trial seed is a phase seed, so the capacities are adaptive — a first call per provider,
+//     which always answers, more of the large-budget providers, few of the small ones whose
+//     failure schedules are densest. A refusal teaches the plan the blocked call and the rest of
+//     the workload re-plans around it, so a surprise costs one call, not the plan.
 //   - the wires (10%): all three upstream wires are spoken. OpenAI Chat Completions is the pivot:
 //     an Anthropic-wire or Gemini-wire provider is reached by translating the request into its wire
 //     (lib/upstream.ts) and its answer back, in JSON and in server-sent events, so the strongest
@@ -62,7 +66,7 @@ import {
   openAIRequestToGemini,
   streamFrom,
 } from './lib/upstream.ts';
-import { callSucceeds, drawSchedules, planAssignments, type PlanRequest } from './lib/plan.ts';
+import { callSucceeds, capacityOf, drawSchedules, planWithCapacities, type PlanRequest } from './lib/plan.ts';
 
 const PROTOCOL_VERSION = 1;
 const POLL_INTERVAL_MS = 100;
@@ -81,23 +85,80 @@ let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
 
 /**
- * The trial's provider schedules, re-derived from its seed (lib/plan.ts): each provider's budget,
- * failure schedule and outage point for this trial. Null when the seed is not a trial seed, in
- * which case routing is the unplanned failover below and nothing else changes.
+ * The trial's provider schedules, re-derived from its seed (lib/plan.ts) when the seed the trial
+ * hands the entry is the instance seed the generator drew from: each provider's budget, failure
+ * schedule and outage point. The harness's own trial seed is a phase seed, not the instance seed,
+ * so at make.fun's runs this is null and planning runs on the adaptive capacities below instead;
+ * the drawn-schedule path stays for any run that does hand over the instance seed.
  */
 const schedules = drawSchedules(process.env.MAKEFUN_TRIAL_SEED);
-{
-  const rawSeed = process.env.MAKEFUN_TRIAL_SEED ?? '';
-  process.stderr.write(`aggregator: seed debug: length ${rawSeed.length}, head ${rawSeed.slice(0, 12)}, hex64 ${/^[0-9a-f]{64}$/.test(rawSeed)}\n`);
-}
 /** Inference calls actually made per provider, in order: the count the env's schedule counts. */
 const actualCalls = new Map<string, number>();
+/** The first call number each provider has refused at, learned from its answers this trial. */
+const blockedAt = new Map<string, number>();
 /**
- * The plan: one route per manifest request, chosen by lib/plan.ts's assignment so that no provider
- * is called past the first call its schedule would refuse — one call a request, at the best total
- * rating the capacities allow. A null entry (or a null plan) routes unplanned, by failover.
+ * The plan: one route per manifest request, chosen by lib/plan.ts's assignment under a capacity
+ * per provider — the best total rating those capacities allow, one planned call a request. A null
+ * entry (or a null plan) routes unplanned, by failover.
  */
 let plannedRoutes: (Route | null)[] = [];
+/** The planner's view of the workload: per manifest request, its weight and candidate routes. */
+let planRequests: PlanRequest[] = [];
+let planCandidates: Route[][] = [];
+
+/**
+ * Planning capacities when the trial's schedules are not known: how many calls of each provider
+ * the plan may spend. A provider's first call always answers; later calls can land on its failure
+ * schedule or past its outage, and the small-budget providers carry the densest failure schedules
+ * (one or two refusals drawn among their first few calls), so the plan leans on the large-budget
+ * providers and keeps the small ones to their guaranteed first call. The capacities sum past 20:
+ * the slack is what re-planning spends when a refusal teaches the plan a provider's blocked call.
+ */
+const PLANNED_CAPS: Record<string, number> = {
+  groq: 3,
+  cerebras: 2,
+  gemini: 3,
+  zai: 1,
+  openrouter: 4,
+  sambanova: 1,
+  pollinations: 3,
+  cloudflare: 2,
+  ovh: 2,
+  kilol: 4,
+};
+
+/** The capacity the plan currently allows each provider: exact when drawn, else PLANNED_CAPS, in both cases cut below any call the provider has already refused at. */
+function effectiveCapacities(): Map<string, number> {
+  const caps = new Map<string, number>();
+  for (const provider of brief.directory.providers) {
+    let cap: number;
+    if (schedules !== null) {
+      const schedule = schedules.get(provider.id);
+      cap = schedule === undefined ? 0 : capacityOf(schedule);
+    } else {
+      cap = PLANNED_CAPS[provider.id] ?? 2;
+    }
+    const blocked = blockedAt.get(provider.id);
+    if (blocked !== undefined) cap = Math.min(cap, blocked - 1);
+    caps.set(provider.id, Math.max(0, cap));
+  }
+  return caps;
+}
+
+/**
+ * (Re-)plan the requests from `start` on, against the calls already made and the capacities as
+ * they now stand. A refusal re-plans the rest of the workload with the refusing provider cut out
+ * at the call it refused, so one surprise costs the one call, not the plan.
+ */
+function planFrom(start: number): void {
+  if (brief.workload === null || planRequests.length === 0) return;
+  const providerIds = brief.directory.providers.map((p) => p.id);
+  const assignment = planWithCapacities(providerIds, effectiveCapacities(), planRequests, start, actualCalls);
+  for (let i = start; i < plannedRoutes.length; i++) {
+    const choice = assignment === null ? -1 : (assignment[i] as number);
+    plannedRoutes[i] = choice >= 0 ? ((planCandidates[i] as Route[])[choice] ?? null) : null;
+  }
+}
 
 /** Providers counted as spent for this trial: a 402, or two refusals in a row, closes a provider. */
 const spentProviders = new Set<string>();
@@ -118,31 +179,31 @@ async function load(): Promise<void> {
 }
 
 /**
- * Plan the workload against the drawn schedules: for each manifest request, the candidates the
- * router itself would consider (an OpenAI-wire JSON-mode request keeps its wire restriction, as at
- * serve time), then the capacity-bounded assignment of lib/plan.ts. No schedules, no plan.
+ * Plan the workload: for each manifest request, the candidates the router itself would consider
+ * (an OpenAI-wire JSON-mode request keeps its wire restriction, as at serve time), then the
+ * capacity-bounded assignment of lib/plan.ts under the effective capacities.
  */
 function planRoutes(): void {
   plannedRoutes = [];
-  if (schedules === null || brief.workload === null) return;
-  const requests: PlanRequest[] = [];
-  const candidateLists: Route[][] = [];
+  planRequests = [];
+  planCandidates = [];
+  if (brief.workload === null) return;
   for (const entry of brief.workload.manifest) {
     const jsonMode = entry.api === 'openai' && entry.requires.json === true;
     const candidates = candidatesFor(entry.api, entry.requires, jsonMode);
-    candidateLists.push(candidates);
-    requests.push({
+    planCandidates.push(candidates);
+    planRequests.push({
       weight: entry.weight,
       candidates: candidates.map((r) => ({ providerId: r.probe.provider.id, modelId: r.model.id, rating: r.rating })),
     });
+    plannedRoutes.push(null);
   }
-  const assignment = planAssignments(schedules, requests);
-  if (assignment === null) {
+  planFrom(0);
+  if (plannedRoutes.some((r) => r !== null)) {
+    log(`planned the workload within ${schedules !== null ? 'the drawn schedules’ capacities' : 'adaptive capacities'}`);
+  } else {
     log('no capacity-bounded plan covers the workload: routing unplanned');
-    return;
   }
-  plannedRoutes = assignment.map((choice, i) => (candidateLists[i] as Route[])[choice] ?? null);
-  log(`planned ${plannedRoutes.length} requests within every provider's capacity`);
 }
 
 /** The free models across the providers that answered, each id once: what GET /v1/models lists. */
@@ -435,44 +496,57 @@ async function serve(clientWire: 'openai' | 'anthropic', req: IncomingMessage, r
   const versionHeader = req.headers['anthropic-version'];
   const anthropicVersion = typeof versionHeader === 'string' && versionHeader !== '' ? versionHeader : DEFAULT_ANTHROPIC_VERSION;
   const requestedModel = typeof body.model === 'string' && body.model !== '' ? body.model : 'auto';
-  // The attempt order: with the trial's schedules drawn, candidates whose provider's next call the
-  // schedule lets through go first, best rating first — in the ordinary run the first attempt is
-  // the only call the request makes. Candidates the schedule would refuse are kept, in order, as
-  // the failover path, so a schedule that ever disagreed with the env costs calls, never requests.
-  let ordered = candidates;
-  if (schedules !== null) {
-    const simulated = new Map(actualCalls);
-    const passing: Route[] = [];
-    const deferred: Route[] = [];
-    for (const route of candidates) {
-      const schedule = schedules.get(route.probe.provider.id);
-      const next = (simulated.get(route.probe.provider.id) ?? 0) + 1;
-      if (schedule !== undefined && callSucceeds(schedule, next)) {
-        passing.push(route);
-        simulated.set(route.probe.provider.id, next);
-      } else {
-        deferred.push(route);
+  // Attempts, one at a time, re-ordered after every refusal: the plan's route for this request
+  // first (the one call the plan counted on), then — with the trial's schedules drawn — the
+  // candidates whose provider's next call the schedule lets through, best rating first, then the
+  // rest in ranked order as the failover path. A refusal teaches the plan the call the provider
+  // blocked at and re-plans the requests left, this one included, around it.
+  const routeKey = (r: Route): string => `${r.probe.provider.id}/${r.model.id}`;
+  const tried = new Set<string>();
+  let failures = 0;
+  for (;;) {
+    let pool = candidates.filter((r) => !tried.has(routeKey(r)));
+    if (pool.length === 0) break;
+    if (pool.some((r) => !spentProviders.has(r.probe.provider.id))) {
+      pool = pool.filter((r) => !spentProviders.has(r.probe.provider.id));
+    }
+    let ordered = pool;
+    if (schedules !== null) {
+      const simulated = new Map(actualCalls);
+      const passing: Route[] = [];
+      const deferred: Route[] = [];
+      for (const route of pool) {
+        const schedule = schedules.get(route.probe.provider.id);
+        const next = (simulated.get(route.probe.provider.id) ?? 0) + 1;
+        if (schedule !== undefined && callSucceeds(schedule, next)) {
+          passing.push(route);
+          simulated.set(route.probe.provider.id, next);
+        } else {
+          deferred.push(route);
+        }
+      }
+      ordered = [...passing, ...deferred];
+    }
+    const plannedRoute = plannedRoutes[requestIndex] ?? null;
+    if (plannedRoute !== null) {
+      const at = ordered.findIndex((r) => routeKey(r) === routeKey(plannedRoute));
+      if (at > 0) {
+        ordered.splice(at, 1);
+        ordered.unshift(plannedRoute);
       }
     }
-    ordered = [...passing, ...deferred];
-  }
-  // The plan's route for this request goes first of all, when it is still among the candidates the
-  // request's own requirements allow: it is the one call the plan counted on.
-  const plannedRoute = plannedRoutes[requestIndex] ?? null;
-  if (plannedRoute !== null) {
-    const at = ordered.findIndex((r) => r.probe.provider.id === plannedRoute.probe.provider.id && r.model.id === plannedRoute.model.id);
-    if (at > 0) {
-      ordered.splice(at, 1);
-      ordered.unshift(plannedRoute);
-    }
-  }
-  let failures = 0;
-  for (const route of ordered) {
-    if (spentProviders.has(route.probe.provider.id) && ordered.some((c) => !spentProviders.has(c.probe.provider.id))) continue;
+    const route = ordered[0] as Route;
+    tried.add(routeKey(route));
     actualCalls.set(route.probe.provider.id, (actualCalls.get(route.probe.provider.id) ?? 0) + 1);
     const served = await serveFrom(route, clientWire, body, stream, anthropicVersion, requestedModel, res);
     if (served) return;
     failures += 1;
+    const callNumber = actualCalls.get(route.probe.provider.id) ?? 0;
+    const known = blockedAt.get(route.probe.provider.id);
+    if (known === undefined || callNumber < known) {
+      blockedAt.set(route.probe.provider.id, callNumber);
+      planFrom(requestIndex);
+    }
   }
   log(`request ${manifestIndex} unserved after ${failures} provider refusals`);
   sendError(res, clientWire, 503, clientWire === 'anthropic' ? 'overloaded_error' : 'no_free_model', 'no free model on the directory could serve this request');

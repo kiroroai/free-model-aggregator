@@ -160,16 +160,24 @@ export interface PlanRequest {
 }
 
 /**
- * Assign one route to every request, maximising the weighted sum of ratings, with no provider used
- * past its capacity — a dynamic program over the requests, its state the counts each provider has
- * been given so far. Returns one candidate index per request, or null when no assignment covers
- * every request within capacity (the caller then routes unplanned). Ties keep the earliest found,
- * so the same brief and seed plan the same assignment on every run.
+ * Assign one route to every request from index `start` on, maximising the weighted sum of ratings,
+ * with no provider used past its capacity — a dynamic program over the requests, its state the
+ * counts each provider has been given so far, starting from `baseCounts` (calls already made).
+ * Returns one candidate index per request from `start` on, or null when no assignment covers every
+ * remaining request within capacity (the caller then routes unplanned). Ties keep the earliest
+ * found, so the same brief, counts and answers plan the same assignment on every run — including
+ * the replay, which sees the same answers and so re-plans identically.
  */
-export function planAssignments(schedules: Map<string, ProviderSchedule>, requests: readonly PlanRequest[]): number[] | null {
-  const providerIds = [...schedules.keys()];
+export function planWithCapacities(
+  providerIds: readonly string[],
+  capacities: ReadonlyMap<string, number>,
+  requests: readonly PlanRequest[],
+  start = 0,
+  baseCounts: ReadonlyMap<string, number> = new Map(),
+): number[] | null {
   const providerIndex = new Map(providerIds.map((id, i) => [id, i]));
-  const capacities = providerIds.map((id) => capacityOf(schedules.get(id) as ProviderSchedule));
+  const caps = providerIds.map((id) => capacities.get(id) ?? 0);
+  const base = providerIds.map((id) => baseCounts.get(id) ?? 0);
   interface Cell {
     value: number;
     prevKey: string;
@@ -177,14 +185,15 @@ export function planAssignments(schedules: Map<string, ProviderSchedule>, reques
   }
   let layer = new Map<string, Cell>([['', { value: 0, prevKey: '', choice: -1 }]]);
   const layers: Map<string, Cell>[] = [layer];
-  const countsOf = (key: string): number[] => (key === '' ? providerIds.map(() => 0) : key.split(',').map(Number));
-  for (const request of requests) {
+  const countsOf = (key: string): number[] => (key === '' ? [...base] : key.split(',').map(Number));
+  for (let i = start; i < requests.length; i++) {
+    const request = requests[i] as PlanRequest;
     const next = new Map<string, Cell>();
     for (const [key, cell] of layer) {
       const counts = countsOf(key);
       request.candidates.forEach((candidate, choice) => {
         const pi = providerIndex.get(candidate.providerId);
-        if (pi === undefined || counts[pi] >= (capacities[pi] as number)) return;
+        if (pi === undefined || counts[pi] >= (caps[pi] as number)) return;
         const nextCounts = [...counts];
         nextCounts[pi] = (nextCounts[pi] as number) + 1;
         const nextKey = nextCounts.join(',');
@@ -207,11 +216,18 @@ export function planAssignments(schedules: Map<string, ProviderSchedule>, reques
   }
   const assignment: number[] = new Array(requests.length).fill(-1);
   let key = bestKey;
-  for (let i = requests.length - 1; i >= 0; i--) {
-    const cell = (layers[i + 1] as Map<string, Cell>).get(key);
+  for (let i = requests.length - 1; i >= start; i--) {
+    const cell = (layers[i - start + 1] as Map<string, Cell>).get(key);
     if (cell === undefined) return null;
     assignment[i] = cell.choice;
     key = cell.prevKey;
   }
   return assignment;
+}
+
+/** The planWithCapacities assignment under the exact capacities a drawn schedule gives. */
+export function planAssignments(schedules: Map<string, ProviderSchedule>, requests: readonly PlanRequest[]): number[] | null {
+  const providerIds = [...schedules.keys()];
+  const capacities = new Map(providerIds.map((id) => [id, capacityOf(schedules.get(id) as ProviderSchedule)]));
+  return planWithCapacities(providerIds, capacities, requests);
 }
