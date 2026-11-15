@@ -86,6 +86,10 @@ let manifestIndex = 0;
  * which case routing is the unplanned failover below and nothing else changes.
  */
 const schedules = drawSchedules(process.env.MAKEFUN_TRIAL_SEED);
+{
+  const rawSeed = process.env.MAKEFUN_TRIAL_SEED ?? '';
+  process.stderr.write(`aggregator: seed debug: length ${rawSeed.length}, head ${rawSeed.slice(0, 12)}, hex64 ${/^[0-9a-f]{64}$/.test(rawSeed)}\n`);
+}
 /** Inference calls actually made per provider, in order: the count the env's schedule counts. */
 const actualCalls = new Map<string, number>();
 /**
