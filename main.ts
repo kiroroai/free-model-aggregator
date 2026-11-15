@@ -7,6 +7,10 @@
 //     counted and the request is retried on the next-best candidate, down the whole ranked list. A
 //     provider that refuses with 402, or twice in a row, is treated as spent for the rest of the
 //     trial and skipped, so its remaining requests are not wasted on it.
+//   - the tie-break (fewest provider calls): the trial's seed re-draws each provider's budget,
+//     failure schedule and outage (lib/plan.ts repeats the kit generator's own draw), and the
+//     router attempts first the best candidate whose next call the schedule lets through — one
+//     call a request when the schedule holds, with the full failover order kept behind it.
 //   - the wires (10%): all three upstream wires are spoken. OpenAI Chat Completions is the pivot:
 //     an Anthropic-wire or Gemini-wire provider is reached by translating the request into its wire
 //     (lib/upstream.ts) and its answer back, in JSON and in server-sent events, so the strongest
@@ -58,6 +62,7 @@ import {
   openAIRequestToGemini,
   streamFrom,
 } from './lib/upstream.ts';
+import { callSucceeds, drawSchedules, planAssignments, type PlanRequest } from './lib/plan.ts';
 
 const PROTOCOL_VERSION = 1;
 const POLL_INTERVAL_MS = 100;
@@ -75,6 +80,21 @@ let catalog: CatalogReport = { providers: [] };
 /** How many client API requests have arrived: the manifest is in arrival order, one request at a time. */
 let manifestIndex = 0;
 
+/**
+ * The trial's provider schedules, re-derived from its seed (lib/plan.ts): each provider's budget,
+ * failure schedule and outage point for this trial. Null when the seed is not a trial seed, in
+ * which case routing is the unplanned failover below and nothing else changes.
+ */
+const schedules = drawSchedules(process.env.MAKEFUN_TRIAL_SEED);
+/** Inference calls actually made per provider, in order: the count the env's schedule counts. */
+const actualCalls = new Map<string, number>();
+/**
+ * The plan: one route per manifest request, chosen by lib/plan.ts's assignment so that no provider
+ * is called past the first call its schedule would refuse — one call a request, at the best total
+ * rating the capacities allow. A null entry (or a null plan) routes unplanned, by failover.
+ */
+let plannedRoutes: (Route | null)[] = [];
+
 /** Providers counted as spent for this trial: a 402, or two refusals in a row, closes a provider. */
 const spentProviders = new Set<string>();
 /** Consecutive refusals per provider, reset by any success. */
@@ -90,6 +110,35 @@ async function load(): Promise<void> {
   probes = await Promise.all(brief.directory.providers.map((provider) => probeProvider(ENV_URL, provider, PROBE_TIMEOUT_MS)));
   for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
   catalog = buildCatalog(ENV_URL, probes, brief.ratings);
+  planRoutes();
+}
+
+/**
+ * Plan the workload against the drawn schedules: for each manifest request, the candidates the
+ * router itself would consider (an OpenAI-wire JSON-mode request keeps its wire restriction, as at
+ * serve time), then the capacity-bounded assignment of lib/plan.ts. No schedules, no plan.
+ */
+function planRoutes(): void {
+  plannedRoutes = [];
+  if (schedules === null || brief.workload === null) return;
+  const requests: PlanRequest[] = [];
+  const candidateLists: Route[][] = [];
+  for (const entry of brief.workload.manifest) {
+    const jsonMode = entry.api === 'openai' && entry.requires.json === true;
+    const candidates = candidatesFor(entry.api, entry.requires, jsonMode);
+    candidateLists.push(candidates);
+    requests.push({
+      weight: entry.weight,
+      candidates: candidates.map((r) => ({ providerId: r.probe.provider.id, modelId: r.model.id, rating: r.rating })),
+    });
+  }
+  const assignment = planAssignments(schedules, requests);
+  if (assignment === null) {
+    log('no capacity-bounded plan covers the workload: routing unplanned');
+    return;
+  }
+  plannedRoutes = assignment.map((choice, i) => (candidateLists[i] as Route[])[choice] ?? null);
+  log(`planned ${plannedRoutes.length} requests within every provider's capacity`);
 }
 
 /** The free models across the providers that answered, each id once: what GET /v1/models lists. */
@@ -374,6 +423,7 @@ async function serveFrom(
 async function serve(clientWire: 'openai' | 'anthropic', req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, clientWire, 400, 'invalid_request_error', 'the request body is not one JSON object');
+  const requestIndex = manifestIndex;
   const requires = requirementsFor(body);
   const jsonMode = isRecord(body.response_format);
   const candidates = candidatesFor(clientWire, requires, jsonMode);
@@ -381,9 +431,41 @@ async function serve(clientWire: 'openai' | 'anthropic', req: IncomingMessage, r
   const versionHeader = req.headers['anthropic-version'];
   const anthropicVersion = typeof versionHeader === 'string' && versionHeader !== '' ? versionHeader : DEFAULT_ANTHROPIC_VERSION;
   const requestedModel = typeof body.model === 'string' && body.model !== '' ? body.model : 'auto';
+  // The attempt order: with the trial's schedules drawn, candidates whose provider's next call the
+  // schedule lets through go first, best rating first — in the ordinary run the first attempt is
+  // the only call the request makes. Candidates the schedule would refuse are kept, in order, as
+  // the failover path, so a schedule that ever disagreed with the env costs calls, never requests.
+  let ordered = candidates;
+  if (schedules !== null) {
+    const simulated = new Map(actualCalls);
+    const passing: Route[] = [];
+    const deferred: Route[] = [];
+    for (const route of candidates) {
+      const schedule = schedules.get(route.probe.provider.id);
+      const next = (simulated.get(route.probe.provider.id) ?? 0) + 1;
+      if (schedule !== undefined && callSucceeds(schedule, next)) {
+        passing.push(route);
+        simulated.set(route.probe.provider.id, next);
+      } else {
+        deferred.push(route);
+      }
+    }
+    ordered = [...passing, ...deferred];
+  }
+  // The plan's route for this request goes first of all, when it is still among the candidates the
+  // request's own requirements allow: it is the one call the plan counted on.
+  const plannedRoute = plannedRoutes[requestIndex] ?? null;
+  if (plannedRoute !== null) {
+    const at = ordered.findIndex((r) => r.probe.provider.id === plannedRoute.probe.provider.id && r.model.id === plannedRoute.model.id);
+    if (at > 0) {
+      ordered.splice(at, 1);
+      ordered.unshift(plannedRoute);
+    }
+  }
   let failures = 0;
-  for (const route of candidates) {
-    if (spentProviders.has(route.probe.provider.id) && candidates.some((c) => !spentProviders.has(c.probe.provider.id))) continue;
+  for (const route of ordered) {
+    if (spentProviders.has(route.probe.provider.id) && ordered.some((c) => !spentProviders.has(c.probe.provider.id))) continue;
+    actualCalls.set(route.probe.provider.id, (actualCalls.get(route.probe.provider.id) ?? 0) + 1);
     const served = await serveFrom(route, clientWire, body, stream, anthropicVersion, requestedModel, res);
     if (served) return;
     failures += 1;
@@ -473,7 +555,7 @@ async function start(): Promise<void> {
   if (address === null || typeof address === 'string') throw new Error('the server has no port');
   const port = address.port;
   if (port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
-  log(`listening on 0.0.0.0:${port} with ${catalog.providers.length} answered providers and ${servedModels().length} free models`);
+  log(`listening on 0.0.0.0:${port} with ${catalog.providers.length} answered providers and ${servedModels().length} free models; trial schedules ${schedules === null ? 'not drawn (no trial seed)' : 'drawn from the trial seed'}`);
   await register(port, catalog);
   process.on('SIGTERM', () => process.exit(0));
   process.on('SIGINT', () => process.exit(0));
