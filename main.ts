@@ -116,7 +116,7 @@ let planCandidates: Route[][] = [];
  */
 const PLANNED_CAPS: Record<string, number> = {
   groq: 3,
-  cerebras: 1,
+  cerebras: 2,
   gemini: 3,
   zai: 1,
   openrouter: 4,
